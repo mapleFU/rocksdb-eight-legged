@@ -15,6 +15,7 @@ Papers:
 * FAST'20: [Characterizing, Modeling, and Benchmarking RocksDB Key-Value Workloads at Facebook](https://research.facebook.com/publications/characterizing-modeling-and-benchmarking-rocksdb-key-value-workloads-at-facebook/)
 * FAST'21: [Evolution of Development Priorities in Key-value Stores Serving Large-scale Applications: The RocksDB Experience](https://research.facebook.com/publications/evolution-of-development-priorities-in-key-value-stores-serving-large-scale-applications-the-rocksdb-experience/)
 * TOS'21: [RocksDB: Evolution of Development Priorities in a Key-value Store Serving Large-scale Applications](https://research.facebook.com/publications/rocksdb-evolution-of-development-priorities-in-a-key-value-store-serving-large-scale-applications/)
+* SIGMOD'23: **Disaggregating RocksDB: A Production Experience**
 
 ## Interesting use cases
 
