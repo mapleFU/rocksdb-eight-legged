@@ -29,7 +29,7 @@ https://blog.mwish.me/2023/01/22/Fast21-RocksDB/
 
 > 然而，NFS 过于复杂，难以高效利用；而块设备接口下，不同主机间的数据共享也很困难。我们意识到，通用的分布式块设备或文件系统过于泛化，可能错失针对性优化机会，从而限制了系统的潜力。RocksDB 的数据和日志文件采用顺序写入，写入后即不可变。任何允许随机写的方案都不可避免地引入额外开销和复杂性。假设数据块不可变的文件系统能实现更高效率，这正是 Tectonic 文件系统的设计假设。
 
-Tectonic 对部分 (1) 延迟关键服务 (2) 不接受容量有小膨胀的服务 还是有影响的
+Tectonic 对部分 (1) 延迟关键服务 (2) 不接受容量有小膨胀的服务 还是有影响的。这里文章没展开，但我觉得容量需要某种程度上仔细考虑：对于原先一副本的，这里实际上相当于一副本变 EC；原来备份或者 Raft 的，如果愿意接受某种程度的架构变化，那么存储是 2/3 份变成多台机器的 1.2-1.5 倍的 EC 存储。
 
 ### 优化
 
@@ -60,3 +60,43 @@ Tectonic 对部分 (1) 延迟关键服务 (2) 不接受容量有小膨胀的服�
 这里在 MultiGet 和 Iterator 处理的时候，官方提到了 Adaptive 增大读 io 的模式:
 
 > RocksDB 通过预读减少迭代器路径上的 IO，预读有两种模式：固定配置和自适应。HDD 用户通常用固定预读，但在 Tectonic 上会导致过多网络带宽消耗。自适应模式从读取一个块开始，不断翻倍直到最大 256KB。但这种方式在 Tectonic 上预热太慢。为此，我们让 RocksDB 基于历史统计设置初始预读大小，并使最大值可配置。
+
+这里还在 4.1.5 提到了 `MGet` 的并行访问，我理解本质上是延迟-访问量的 Trade-off。
+
+### Redundancy with low overhead
+
+* SST 占用主要存储空间和写带宽
+  * We chose [12,8] encoding (4 parity blocks for 8 data blocks)
+* WAL 需要 low tail latency for small (sub-block) appends with persistence
+  * We use 5-Way Replica (R5) encoding for WAL and other log files
+  * First, Replica encoding provides better tail latencies with no RS-Encoding overhead for small size writes. 
+  * Second, unlike RS-Encoding, we don’t need write size alignment or padding for replica encoding. 
+  * Finally, we use R5 instead of R3 or other settings, as R5 is sufficient to meet our availability needs based on host failure probabilities.
+* WAL 尽量使用条带化 EC
+  * 条带化编码需收集一条带（或多条带）数据后再刷新。例如 [12,8] 编码 +8KB 条带时，将 8KB 数据分成 8 个 1KB 数据块，生成 4 个 1KB 校验块，共 12 个 1KB 块分发到 12 个存储节点
+  * 每个节点将 1KB 块追加到对应的 XFS 文件（通常为 8MB）。条带大小按文件类型预设。偶尔需刷新非对齐数据时，会用零填充对齐后编码并刷新。
+  * 条带较小会降低随机读效率，因为需从多个节点组装并解码，但日志文件几乎总是顺序读取，因此该方案适用。
+
+### cooperative IO Fencing
+
+* RocksDB directory must first ’IO Fence’ the directory using a token (a variable length byte string), and then use the same token for all subsequent operations on that directory and files under it.
+* The expectation is that the fencing will be successful if the token is **lexicographically greater than** the previous fencing token used by any other process on that directory.
+* Internally, Tectonic executes a sequence of steps to guarantee fencing.
+  * First, it updates the token on the directory in the metadata system, provided it compares favorably.
+  * Tectonic then iterates over the list of mutable (unsealed) files under the directory, and performs two actions, (a) it updates the token on the file metadata, and (b) seals the tail writable block of the file by connecting to the storage nodes and sealing their corresponding chunks.
+
+本质上还是 cooperative 的去 seal 之前的，然后要求切一些新的，是一个还比较重的 meta 操作。但感觉这里有个问题是，写入的时候也不应该依赖一些 Partial 的操作。
+
+### IO Timeouts / Errors
+
+> 刷盘和合并等操作设置较长的超时时间，而对 Get() 或迭代器等操作则设置亚秒级超时。RocksDB 新增了可配置参数 request deadline，若请求超时则直接返回失败。用户设置的 deadline 会传递给 Tectonic。
+
+本质是分布式 fs 可能 timeout 需要设置比较长，同时一些操作可以容忍慢 IO。前台操作要保证 SLA，后台一些操作还好。超时的时候可能需要一些特殊处理或者直接判定 Fail。
+
+历史上，RocksDB 在 WAL 写入/同步、后台刷盘和合并等关键数据库操作遇到 IO 错误时，会切换为只读模式，以保证数据库一致性。这与 Ext4、XFS 等本地文件系统的做法类似。
+
+在 Tectonic 上，如同大部分分布式系统，IO 错误更多，有的是可以快速恢复的，有的则和单机一样不能恢复。总之，这里的错误率会远比单机的高，但很多也是可以恢复的。这里需要判定更多的 Status: 
+
+> 为此，我们增强了文件系统 API 的返回状态，不仅包含错误码，还包括可重试性、作用域（文件级或全局）及是否永久丢失等元数据。Tectonic 可据此判断错误是否可恢复。RocksDB 侧则聚焦于在文件系统写入错误后恢复数据库一致性并恢复写入。
+>
+> 对于某些写入失败（如后台刷盘或合并），操作会自动重试且无用户停机。而 WAL 写入失败等情况，则需暂时停止写入，将 memtable 刷盘以保证一致性。
